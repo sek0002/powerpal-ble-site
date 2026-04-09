@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import struct
 from contextlib import asynccontextmanager
@@ -17,12 +18,15 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 
 load_dotenv()
 
+LOGGER = logging.getLogger(__name__)
+
 APP_TITLE = os.getenv("APP_TITLE", "Powerpal BLE Site")
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Australia/Melbourne")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8002"))
 BLE_MAC = os.getenv("BLE_MAC", "C9:91:09:7A:2C:B9")
 BLE_PAIRING_CODE = os.getenv("BLE_PAIRING_CODE", "774034")
+BLE_READING_BATCH_SIZE_MINUTES = int(os.getenv("BLE_READING_BATCH_SIZE_MINUTES", "1"))
 BLE_CONNECTION_TIMEOUT_SECONDS = float(os.getenv("BLE_CONNECTION_TIMEOUT_SECONDS", "30"))
 BLE_RETRY_DELAY_SECONDS = float(os.getenv("BLE_RETRY_DELAY_SECONDS", "5"))
 
@@ -42,6 +46,8 @@ class LatestBleState:
     last_success_at: Optional[str] = None
     resolved_address: Optional[str] = None
     resolved_name: Optional[str] = None
+    configured_batch_minutes: Optional[int] = None
+    device_batch_minutes: Optional[int] = None
 
 
 class PowerpalBleSitePoller:
@@ -59,14 +65,20 @@ class PowerpalBleSitePoller:
         exact_match = None
         name_match = None
         for _, (device, _) in devices.items():
+            device_name = device.name or ""
             if (device.address or "").lower() == BLE_MAC.lower():
                 exact_match = device
                 break
-            if "powerpal" in (device.name or "").lower() and name_match is None:
+            if "powerpal" in device_name.lower() and name_match is None:
                 name_match = device
         if exact_match is not None:
             return exact_match
         if name_match is not None:
+            LOGGER.warning(
+                "Using Powerpal device matched by name instead of exact MAC: requested=%s resolved=%s",
+                BLE_MAC,
+                getattr(name_match, "address", "unknown"),
+            )
             return name_match
         raise BleakError(f"Could not find Powerpal device during scan for {BLE_MAC}")
 
@@ -81,7 +93,11 @@ class PowerpalBleSitePoller:
         return {
             "grid_usage_watts": usage_watts,
             "observed_at": utc_time.astimezone(self._melbourne_tz).isoformat(),
+            "raw_bytes_hex": data.hex(),
+            "pulse_byte_4": int_array[4],
+            "pulse_byte_5": int_array[5],
             "pulse_sum": pulse_sum,
+            "original_test2_formula": "grid_usage_watts = (byte4 + byte5) / 0.8",
         }
 
     async def run(self) -> None:
@@ -89,12 +105,20 @@ class PowerpalBleSitePoller:
         while not self._stopped.is_set():
             try:
                 self.latest.state = "connecting"
+                self.latest.resolved_address = None
+                self.latest.resolved_name = None
                 await self._run_session()
                 if not self._stopped.is_set():
                     self.latest.state = "disconnected"
                     self.latest.last_error = "BLE disconnected"
                     await asyncio.sleep(BLE_RETRY_DELAY_SECONDS)
+            except BleakError as exc:
+                LOGGER.warning("BLE error: %s", exc)
+                self.latest.state = "error"
+                self.latest.last_error = str(exc)
+                await asyncio.sleep(BLE_RETRY_DELAY_SECONDS)
             except Exception as exc:
+                LOGGER.exception("Unexpected BLE failure")
                 self.latest.state = "error"
                 self.latest.last_error = str(exc)
                 await asyncio.sleep(BLE_RETRY_DELAY_SECONDS)
@@ -103,6 +127,7 @@ class PowerpalBleSitePoller:
         self._stopped.set()
 
     async def _run_session(self) -> None:
+        batch_size_bytes = int(BLE_READING_BATCH_SIZE_MINUTES).to_bytes(4, byteorder="little")
         resolved_device = await self._resolve_device()
 
         def notification_handler(_: Any, data: bytearray) -> None:
@@ -116,11 +141,13 @@ class PowerpalBleSitePoller:
         async with BleakClient(resolved_device, timeout=BLE_CONNECTION_TIMEOUT_SECONDS) as client:
             self.latest.resolved_address = getattr(resolved_device, "address", BLE_MAC)
             self.latest.resolved_name = getattr(resolved_device, "name", None)
+            self.latest.configured_batch_minutes = BLE_READING_BATCH_SIZE_MINUTES
 
             try:
-                await client.pair()
-            except Exception:
-                pass
+                paired = await client.pair()
+                LOGGER.info("BLE pair result: %s", paired)
+            except Exception as exc:
+                LOGGER.debug("BLE pair step skipped or unsupported: %s", exc)
 
             await client.write_gatt_char(
                 PAIRING_CODE_CHAR,
@@ -128,17 +155,30 @@ class PowerpalBleSitePoller:
                 response=False,
             )
             await asyncio.sleep(2.0)
-            await client.write_gatt_char(
-                POWERPAL_FREQ_CHAR,
-                int(1).to_bytes(4, byteorder="little"),
-                response=False,
-            )
+
+            current_batch_minutes = None
+            try:
+                batch_value = await client.read_gatt_char(POWERPAL_FREQ_CHAR)
+                if len(batch_value) >= 4:
+                    current_batch_minutes = int.from_bytes(batch_value[:4], byteorder="little", signed=False)
+            except Exception as exc:
+                LOGGER.debug("Unable to read Powerpal batch size", exc_info=exc)
+
+            if current_batch_minutes != BLE_READING_BATCH_SIZE_MINUTES:
+                await client.write_gatt_char(
+                    POWERPAL_FREQ_CHAR,
+                    batch_size_bytes,
+                    response=False,
+                )
+
+            self.latest.device_batch_minutes = current_batch_minutes
+
             try:
                 battery_value = await client.read_gatt_char(BATTERY_CHAR)
                 if battery_value:
                     self.latest.battery_percent = int(battery_value[0])
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("Unable to read Powerpal battery level", exc_info=exc)
 
             await client.start_notify(NOTIFY_CHAR, notification_handler)
             self.latest.state = "connected"
@@ -196,8 +236,8 @@ async def root() -> PlainTextResponse:
 
 @app.get("/html", response_class=HTMLResponse)
 async def html_page() -> HTMLResponse:
-    latest = poller.latest
     body_text = _text_payload()
+    now = datetime.now(timezone.utc).isoformat()
     return HTMLResponse(
         f"""<!doctype html>
 <html lang="en">
@@ -235,7 +275,7 @@ async def html_page() -> HTMLResponse:
 <body>
   <main>
     <h1>{APP_TITLE}</h1>
-    <div class="meta">State: {latest.state} | Battery: {latest.battery_percent if latest.battery_percent is not None else "-"}%</div>
+    <div class="meta">Simple BLE text page for remote scraping. Updated {now}.</div>
     <pre>{body_text}</pre>
   </main>
 </body>
