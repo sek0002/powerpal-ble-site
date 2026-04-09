@@ -116,22 +116,16 @@ class PowerpalBleSitePoller:
         client = BleakClient(BLE_MAC)
         await client.connect(timeout=BLE_CONNECTION_TIMEOUT_SECONDS)
         try:
+            _ = client.services
             self.latest.resolved_address = BLE_MAC
             self.latest.resolved_name = None
             self.latest.configured_batch_minutes = BLE_READING_BATCH_SIZE_MINUTES
-
-            try:
-                paired = await client.pair()
-                LOGGER.info("BLE pair result: %s", paired)
-            except Exception as exc:
-                LOGGER.debug("BLE pair step skipped or unsupported: %s", exc)
 
             await client.write_gatt_char(
                 PAIRING_CODE_CHAR,
                 self.convert_pairing_code(BLE_PAIRING_CODE),
                 response=True,
             )
-            await asyncio.sleep(2.0)
             await client.write_gatt_char(
                 POWERPAL_FREQ_CHAR,
                 batch_size_bytes,
@@ -139,10 +133,8 @@ class PowerpalBleSitePoller:
             )
             self.latest.device_batch_minutes = BLE_READING_BATCH_SIZE_MINUTES
 
-            try:
-                await client.read_gatt_char(NOTIFY_CHAR)
-            except Exception as exc:
-                LOGGER.debug("Unable to pre-read Powerpal notify characteristic", exc_info=exc)
+            notify_data = await client.read_gatt_char(NOTIFY_CHAR)
+            LOGGER.debug("Initial notify characteristic read: %s", notify_data)
 
             await client.start_notify(NOTIFY_CHAR, notification_handler)
 
