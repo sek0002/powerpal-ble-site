@@ -1,0 +1,17 @@
+[Unit]
+Description=Powerpal BLE Poller
+After=network-online.target bluetooth.service
+Wants=network-online.target bluetooth.service
+
+[Service]
+Type=simple
+User=sek0002
+WorkingDirectory=/opt/powerpal-ble-site
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/bin/python3 ble_poller.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

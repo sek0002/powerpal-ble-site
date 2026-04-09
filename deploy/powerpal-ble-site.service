@@ -1,14 +1,13 @@
 [Unit]
 Description=Powerpal BLE Site
-After=network-online.target bluetooth.service
-Wants=network-online.target bluetooth.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=sek0002
 WorkingDirectory=/opt/powerpal-ble-site
 Environment=PYTHONUNBUFFERED=1
-ExecStartPre=/bin/sleep 10
 ExecStart=/usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8002
 Restart=always
 RestartSec=10
