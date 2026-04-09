@@ -30,9 +30,6 @@ Copy `.env.example` to `.env` and set at least:
 ## Run locally
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 python3 -m uvicorn main:app --host 0.0.0.0 --port 8002
 ```
 
@@ -45,15 +42,12 @@ Then open:
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip bluetooth bluez
+sudo apt install -y python3 python3-pip bluetooth bluez
 cd /opt
 sudo git clone <repo-url> powerpal-ble-site
 sudo chown -R "$USER":"$USER" /opt/powerpal-ble-site
 cd /opt/powerpal-ble-site
 cp .env.example .env
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 sudo cp deploy/powerpal-ble-site.service /etc/systemd/system/powerpal-ble-site.service
 sudo systemctl daemon-reload
 sudo systemctl enable powerpal-ble-site
