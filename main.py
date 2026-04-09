@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import pytz
-from bleak import BleakClient, BleakError, BleakScanner
+from bleak import BleakClient, BleakError
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, PlainTextResponse
@@ -34,8 +34,6 @@ PAIRING_CODE_CHAR = "59da0011-12f4-25a6-7d4f-55961dce4205"
 POWERPAL_FREQ_CHAR = "59da0013-12f4-25a6-7d4f-55961dce4205"
 NOTIFY_CHAR = "59da0001-12f4-25a6-7d4f-55961dce4205"
 BATTERY_CHAR = "00002a19-0000-1000-8000-00805f9b34fb"
-
-
 @dataclass
 class LatestBleState:
     grid_usage_watts: Optional[float] = None
@@ -59,28 +57,6 @@ class PowerpalBleSitePoller:
     @staticmethod
     def convert_pairing_code(original_pairing_code: str) -> bytes:
         return int(original_pairing_code).to_bytes(4, byteorder="little")
-
-    async def _resolve_device(self) -> Any:
-        devices = await BleakScanner.discover(timeout=BLE_CONNECTION_TIMEOUT_SECONDS, return_adv=True)
-        exact_match = None
-        name_match = None
-        for _, (device, _) in devices.items():
-            device_name = device.name or ""
-            if (device.address or "").lower() == BLE_MAC.lower():
-                exact_match = device
-                break
-            if "powerpal" in device_name.lower() and name_match is None:
-                name_match = device
-        if exact_match is not None:
-            return exact_match
-        if name_match is not None:
-            LOGGER.warning(
-                "Using Powerpal device matched by name instead of exact MAC: requested=%s resolved=%s",
-                BLE_MAC,
-                getattr(name_match, "address", "unknown"),
-            )
-            return name_match
-        raise BleakError(f"Could not find Powerpal device during scan for {BLE_MAC}")
 
     def _parse_notification(self, data: bytearray) -> dict[str, Any]:
         if len(data) < 6:
@@ -128,7 +104,6 @@ class PowerpalBleSitePoller:
 
     async def _run_session(self) -> None:
         batch_size_bytes = int(BLE_READING_BATCH_SIZE_MINUTES).to_bytes(4, byteorder="little")
-        resolved_device = await self._resolve_device()
 
         def notification_handler(_: Any, data: bytearray) -> None:
             payload = self._parse_notification(bytearray(data))
@@ -138,9 +113,11 @@ class PowerpalBleSitePoller:
             self.latest.last_error = None
             self.latest.last_success_at = datetime.now(timezone.utc).isoformat()
 
-        async with BleakClient(resolved_device, timeout=BLE_CONNECTION_TIMEOUT_SECONDS) as client:
-            self.latest.resolved_address = getattr(resolved_device, "address", BLE_MAC)
-            self.latest.resolved_name = getattr(resolved_device, "name", None)
+        client = BleakClient(BLE_MAC)
+        await client.connect(timeout=BLE_CONNECTION_TIMEOUT_SECONDS)
+        try:
+            self.latest.resolved_address = BLE_MAC
+            self.latest.resolved_name = None
             self.latest.configured_batch_minutes = BLE_READING_BATCH_SIZE_MINUTES
 
             try:
@@ -152,26 +129,22 @@ class PowerpalBleSitePoller:
             await client.write_gatt_char(
                 PAIRING_CODE_CHAR,
                 self.convert_pairing_code(BLE_PAIRING_CODE),
-                response=False,
+                response=True,
             )
             await asyncio.sleep(2.0)
+            await client.write_gatt_char(
+                POWERPAL_FREQ_CHAR,
+                batch_size_bytes,
+                response=True,
+            )
+            self.latest.device_batch_minutes = BLE_READING_BATCH_SIZE_MINUTES
 
-            current_batch_minutes = None
             try:
-                batch_value = await client.read_gatt_char(POWERPAL_FREQ_CHAR)
-                if len(batch_value) >= 4:
-                    current_batch_minutes = int.from_bytes(batch_value[:4], byteorder="little", signed=False)
+                await client.read_gatt_char(NOTIFY_CHAR)
             except Exception as exc:
-                LOGGER.debug("Unable to read Powerpal batch size", exc_info=exc)
+                LOGGER.debug("Unable to pre-read Powerpal notify characteristic", exc_info=exc)
 
-            if current_batch_minutes != BLE_READING_BATCH_SIZE_MINUTES:
-                await client.write_gatt_char(
-                    POWERPAL_FREQ_CHAR,
-                    batch_size_bytes,
-                    response=False,
-                )
-
-            self.latest.device_batch_minutes = current_batch_minutes
+            await client.start_notify(NOTIFY_CHAR, notification_handler)
 
             try:
                 battery_value = await client.read_gatt_char(BATTERY_CHAR)
@@ -180,16 +153,18 @@ class PowerpalBleSitePoller:
             except Exception as exc:
                 LOGGER.debug("Unable to read Powerpal battery level", exc_info=exc)
 
-            await client.start_notify(NOTIFY_CHAR, notification_handler)
             self.latest.state = "connected"
+            while not self._stopped.is_set():
+                await asyncio.sleep(1.0)
+        finally:
             try:
-                while not self._stopped.is_set():
-                    await asyncio.sleep(1.0)
-            finally:
                 try:
                     await client.stop_notify(NOTIFY_CHAR)
                 except Exception:
-                    pass
+                    LOGGER.debug("Unable to stop bleak notifications cleanly", exc_info=True)
+                await client.disconnect()
+            except Exception:
+                LOGGER.debug("Unable to disconnect bleak client cleanly", exc_info=True)
 
 
 poller = PowerpalBleSitePoller()
