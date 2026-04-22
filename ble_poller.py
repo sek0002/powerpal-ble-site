@@ -7,6 +7,7 @@ import os
 import shlex
 import struct
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,8 @@ class PowerpalBleWorker:
             "disconnect_count": 0,
             "last_bluetooth_restart_at": None,
             "last_bluetooth_restart_error": None,
+            "last_poller_restart_at": None,
+            "last_poller_restart_error": None,
         }
         self._disconnect_count = 0
 
@@ -128,12 +131,30 @@ class PowerpalBleWorker:
             self._state["disconnect_count"] = 0
             self._persist()
             await asyncio.sleep(BLE_SYSTEMCTL_RESTART_COOLDOWN_SECONDS)
+            await self._restart_poller_process()
         except Exception as exc:
             LOGGER.exception("Unable to restart bluetooth service")
             self._state["last_bluetooth_restart_at"] = restarted_at
             self._state["last_bluetooth_restart_error"] = str(exc)
             self._state["state"] = "error"
             self._state["bluetooth_restart_command"] = BLE_SYSTEMCTL_RESTART_COMMAND
+            self._persist()
+
+    async def _restart_poller_process(self) -> None:
+        restarted_at = datetime.now(timezone.utc).isoformat()
+        try:
+            LOGGER.warning("Restarting BLE poller process after bluetooth service restart")
+            self._state["last_poller_restart_at"] = restarted_at
+            self._state["last_poller_restart_error"] = None
+            self._state["state"] = "restarting_poller"
+            self._persist()
+            await asyncio.sleep(1.0)
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+        except Exception as exc:
+            LOGGER.exception("Unable to restart BLE poller process")
+            self._state["last_poller_restart_at"] = restarted_at
+            self._state["last_poller_restart_error"] = str(exc)
+            self._state["state"] = "error"
             self._persist()
 
     async def run(self) -> None:

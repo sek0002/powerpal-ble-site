@@ -35,7 +35,7 @@ Optional recovery settings:
 
 When the poller records 100 consecutive disconnect/error cycles without a successful
 notification, it will run the configured bluetooth restart command, wait for the
-cooldown, and then resume normal reconnect attempts.
+cooldown, and then restart the poller process itself.
 
 ## Run locally
 
