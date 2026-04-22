@@ -27,6 +27,16 @@ Copy `.env.example` to `.env` and set at least:
 - `BLE_MAC`
 - `BLE_PAIRING_CODE`
 
+Optional recovery settings:
+
+- `BLE_SYSTEMCTL_RESTART_THRESHOLD=100`
+- `BLE_SYSTEMCTL_RESTART_COMMAND="systemctl restart bluetooth"`
+- `BLE_SYSTEMCTL_RESTART_COOLDOWN_SECONDS=30`
+
+When the poller records 100 consecutive disconnect/error cycles without a successful
+notification, it will run the configured bluetooth restart command, wait for the
+cooldown, and then resume normal reconnect attempts.
+
 ## Run locally
 
 ```bash
